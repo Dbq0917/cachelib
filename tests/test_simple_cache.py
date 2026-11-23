@@ -46,6 +46,25 @@ class TestSimpleCache(CommonTests, HasTests, ClearTests, SerializerTests):
         assert cache.set_many(self.sample_pairs)
         assert abs(len(cache._cache) - threshold) <= 1
 
+    def test_large_threshold_evicts_in_expiry_order(self):
+        """With a large threshold, eviction must still remove the
+        earliest-expiring keys first, in order."""
+        threshold = 200_000
+        cache = self.cache_factory(threshold=threshold)
+        for i in range(threshold):
+            cache.set(f"key-{i}", "value", timeout=3600 + i)
+        assert len(cache._cache) == threshold
+        extra = 100
+        for i in range(extra):
+            cache.set(f"extra-{i}", "value", timeout=7200 + i)
+        assert abs(len(cache._cache) - threshold) <= 1
+        # keys with the smallest expiry are evicted first, in order
+        for i in range(extra - 1):
+            assert f"key-{i}" not in cache._cache
+        assert f"key-{extra - 1}" in cache._cache
+        # heap stays consistent with the cache contents
+        assert len(cache._expiry_heap) - cache._stale == len(cache._cache)
+
     def test_prune_old_entries(self):
         threshold = 2 * len(self.sample_pairs) - 1
         cache = self.cache_factory(threshold=threshold)

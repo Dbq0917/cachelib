@@ -1,4 +1,5 @@
 import datetime as dt
+import heapq
 import threading
 import typing as _t
 from time import time
@@ -42,31 +43,59 @@ class SimpleCache(BaseCache):
         self._cache: dict[str, _t.Any] = {}
         self._threshold = threshold or 500  # threshold = 0
         self._lock = threading.RLock()
+        # Min-heap of (expires, seq, key) mirroring ``_cache``, so eviction
+        # pops the earliest-expiring entry in O(log n) instead of re-sorting
+        # the whole dict. ``seq`` preserves dict insertion order for entries
+        # with equal expiry, keeping eviction order identical to a stable
+        # sort by expiry. Overwritten or deleted keys leave stale entries
+        # that are skipped lazily and compacted by ``_rebuild_heap``.
+        self._expiry_heap: list[tuple[int, int, str]] = []
+        self._seq = 0
+        self._stale = 0
 
     def _over_threshold(self) -> bool:
         return len(self._cache) > self._threshold
 
-    def _remove_expired(self, now: float) -> None:
-        toremove = [k for k, (expires, _) in self._cache.items() if expires < now]
-        for k in toremove:
-            self._cache.pop(k, None)
-
-    def _remove_older(self) -> None:
-        k_ordered = (
-            k for k, v in sorted(self._cache.items(), key=lambda item: item[1][0])
-        )
-        for k in k_ordered:
-            self._cache.pop(k, None)
-            if not self._over_threshold():
-                break
-
     def _prune(self) -> None:
-        if self._over_threshold():
-            now = time()
-            self._remove_expired(now)
-        # remove older items if still over threshold
-        if self._over_threshold():
-            self._remove_older()
+        if not self._over_threshold():
+            return
+        now = time()
+        while self._expiry_heap:
+            expires, seq, key = self._expiry_heap[0]
+            current = self._cache.get(key)
+            if current is None or current[0] != expires or current[1] != seq:
+                # stale entry, the key was overwritten or deleted
+                heapq.heappop(self._expiry_heap)
+                self._stale -= 1
+                continue
+            if expires >= now and not self._over_threshold():
+                break
+            heapq.heappop(self._expiry_heap)
+            self._cache.pop(key, None)
+
+    def _rebuild_heap(self) -> None:
+        self._expiry_heap = [
+            (expires, seq, key)
+            for key, (expires, seq, _) in self._cache.items()
+        ]
+        heapq.heapify(self._expiry_heap)
+        self._stale = 0
+
+    def _maybe_rebuild_heap(self) -> None:
+        if self._stale > len(self._cache):
+            self._rebuild_heap()
+
+    def _push_entry(self, key: str, expires: int) -> int:
+        current = self._cache.get(key)
+        if current is not None:
+            # keep the original insertion order for expiry ties
+            seq = current[1]
+            self._stale += 1
+        else:
+            seq = self._seq
+            self._seq += 1
+        heapq.heappush(self._expiry_heap, (expires, seq, key))
+        return seq
 
     def _normalize_timeout(self, timeout: int | dt.timedelta | None) -> int:
         normalized_timeout = BaseCache._normalize_timeout(self, timeout)
@@ -77,7 +106,7 @@ class SimpleCache(BaseCache):
     def get(self, key: str) -> _t.Any:
         with self._lock:
             try:
-                expires, value = self._cache[key]
+                expires, _, value = self._cache[key]
                 if expires == 0 or expires > time():
                     return self.serializer.loads(value)
             except KeyError:
@@ -89,7 +118,9 @@ class SimpleCache(BaseCache):
         with self._lock:
             expires = self._normalize_timeout(timeout)
             self._prune()
-            self._cache[key] = (expires, self.serializer.dumps(value))
+            seq = self._push_entry(key, expires)
+            self._cache[key] = (expires, seq, self.serializer.dumps(value))
+            self._maybe_rebuild_heap()
             return True
 
     def add(
@@ -98,22 +129,28 @@ class SimpleCache(BaseCache):
         with self._lock:
             expires = self._normalize_timeout(timeout)
             self._prune()
-            item = (expires, self.serializer.dumps(value))
             # key exists and is not expired, do not add
             if self.has(key):
                 return False
             # key does not exist or is expired, add it
+            seq = self._push_entry(key, expires)
+            item = (expires, seq, self.serializer.dumps(value))
             self._cache[key] = item
+            self._maybe_rebuild_heap()
             return True
 
     def delete(self, key: str) -> bool:
         with self._lock:
-            return self._cache.pop(key, None) is not None
+            if self._cache.pop(key, None) is None:
+                return False
+            self._stale += 1
+            self._maybe_rebuild_heap()
+            return True
 
     def has(self, key: str) -> bool:
         with self._lock:
             try:
-                expires, value = self._cache[key]
+                expires, _, _ = self._cache[key]
                 return bool(expires == 0 or expires > time())
             except KeyError:
                 return False
@@ -121,6 +158,8 @@ class SimpleCache(BaseCache):
     def clear(self) -> bool:
         with self._lock:
             self._cache.clear()
+            self._expiry_heap.clear()
+            self._stale = 0
             return not bool(self._cache)
 
     def inc(self, key: str, delta: int = 1) -> int | None:
