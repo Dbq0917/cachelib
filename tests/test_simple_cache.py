@@ -244,3 +244,99 @@ class TestSimpleCache(CommonTests, HasTests, ClearTests, SerializerTests):
         assert len(cache._cache) == 1
         assert cache.has("shared") is True
         assert cache.get("shared") in written_values
+
+    def test_concurrent_set_same_key_eight_threads(self):
+        """Eight writers targeting one key must not corrupt the cache."""
+        cache = self.cache_factory()
+        num_threads = 8
+        writes_per_thread = 200
+        barrier = threading.Barrier(num_threads)
+        errors = []
+        result_lock = threading.Lock()
+        written_values = {
+            (thread_id, i)
+            for thread_id in range(num_threads)
+            for i in range(writes_per_thread)
+        }
+
+        def writer(thread_id: int) -> None:
+            barrier.wait()
+            for i in range(writes_per_thread):
+                try:
+                    cache.set("shared", (thread_id, i))
+                except Exception as exc:
+                    with result_lock:
+                        errors.append(exc)
+
+        threads = [
+            threading.Thread(target=writer, args=(thread_id,))
+            for thread_id in range(num_threads)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors, f"Exceptions during concurrent set: {errors}"
+        assert len(cache._cache) == 1
+        assert cache.get("shared") in written_values
+
+    def test_reads_do_not_acquire_write_lock(self):
+        """Readers must not depend on the write lock."""
+        cache = self.cache_factory()
+        cache.set("key", "value")
+
+        class _UnavailableLock:
+            def __enter__(self):
+                raise AssertionError("read attempted to acquire the write lock")
+
+            def __exit__(self, *args):
+                return False
+
+        cache._lock = _UnavailableLock()
+        assert cache.get("key") == "value"
+        assert cache.has("key") is True
+
+    def test_writes_are_not_blocked_by_slow_reads(self):
+        """A slow reader must not prevent a writer from publishing."""
+        cache = self.cache_factory()
+        load_started = threading.Event()
+        release_load = threading.Event()
+
+        class _SlowLoadSerializer:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def dumps(self, value):
+                return self._inner.dumps(value)
+
+            def loads(self, bvalue):
+                load_started.set()
+                if not release_load.wait(2):
+                    raise TimeoutError("slow reader was not released")
+                return self._inner.loads(bvalue)
+
+        cache.serializer = _SlowLoadSerializer(type(cache).serializer)
+        cache.set("shared", "before")
+        observed = []
+        reader = threading.Thread(target=lambda: observed.append(cache.get("shared")))
+        reader.start()
+        assert load_started.wait(2)
+
+        write_done = threading.Event()
+
+        def writer() -> None:
+            cache.set("shared", "after")
+            write_done.set()
+
+        write_thread = threading.Thread(target=writer)
+        write_thread.start()
+        try:
+            assert write_done.wait(2), "write was blocked by an in-flight read"
+        finally:
+            release_load.set()
+            reader.join(2)
+            write_thread.join(2)
+
+        assert observed == ["before"]
+        assert cache.get("shared") == "after"
